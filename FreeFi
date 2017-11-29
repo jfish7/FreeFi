@@ -1,0 +1,213 @@
+#!/usr/bin/python
+
+# -*- coding: utf-8 -*-
+
+"""
+    FreeFi 
+
+    EthicalHacking Fall 2017 
+    UT Austin
+
+    Bypass MAC based security of Wifi access points
+
+    Team 6: Jonathan Fisher, Kevin Hwang, Steven Ritchie, Kiankris Villagonzalo, Sean Wang 
+"""
+# Libraries
+import sys
+import subprocess
+import os
+import re
+import random
+
+# Globals
+IFACE_ORIGINAL_NAME      = None
+IFACE_ORIGINAL_MAC_ADDR  = None
+IFACE_ANONYMOUS_MAC_ADDR = None
+
+IFACE_MAC_ADDR_ANONYMIZED = False
+IFACE_IN_MONITOR_MODE     = False
+
+# Airmong-ng monitor mode interface name extension
+MONITOR_MODE_IFACE_NAME_EXTENSION = "mon"
+
+# External Programs
+EXT_PROG_IWCONFIG = "iwconfig"
+EXT_PROG_IFCONFIG = "ifconfig"
+
+# Console colors
+WH = '\033[0m'
+RE = '\033[31m'  
+GR = '\033[32m'  
+OR = '\033[33m'  
+BL = '\033[34m'  
+PU = '\033[35m'  
+CY = '\033[36m' 
+
+# Route program outputs to /dev/null by default, but can be changed for debugging
+ERRLOG = open(os.devnull, "w")
+OUTLOG = open(os.devnull, "w")
+
+"""
+This function spoofs a mac address and tries to connect to Google without a redirect
+"""
+#def connect(mac): 
+
+"""
+This function finds the devices connected to specfic access point
+"""
+#def find_connected_devices(ap):
+
+"""
+This function returns a list of dictionaries corresponding to an access point
+"""
+#def find_open_access_points():
+
+def shutdown():
+    print "[+] shutting down..."
+    # undo monitor mode
+    # undo mac address change
+    if IFACE_MAC_ADDR_ANONYMIZED == True:
+        print "[+] resetting mac address for interface " + GR + IFACE_ORIGINAL_NAME + WH + "..."
+        change_mac_address(IFACE_ORIGINAL_NAME, IFACE_ANONYMOUS_MAC_ADDR, IFACE_ORIGINAL_MAC_ADDR)
+    print "done\n"
+
+def change_mac_address(iface_name, curr_mac_addr, new_mac_addr):
+    print "[+] changing mac address for interface " + GR + iface_name + WH + " from " + CY + \
+        curr_mac_addr + WH + " to " + CY + new_mac_addr + "..." + WH
+    subprocess.call([EXT_PROG_IFCONFIG, iface_name, "down"], stdout=OUTLOG, stderr=ERRLOG)
+    subproc = subprocess.Popen([EXT_PROG_IFCONFIG, iface_name, 'hw', 'ether', new_mac_addr], stdout=OUTLOG, stderr=ERRLOG)
+    subproc.wait()
+    subprocess.call([EXT_PROG_IFCONFIG, iface_name, 'up'], stdout=OUTLOG, stderr=ERRLOG)    
+    if get_current_mac_address(iface_name) == new_mac_addr:
+        return True
+    return False
+
+def generate_random_mac_address(curr_mac_addr):
+    # change last 3 bytes of mac addr to keep vender part the same
+    random.seed()
+    new_mac_addr = curr_mac_addr[:9]
+    valid_chars = "0123456789abcdef"
+    for i in xrange(0, 3):   
+        new_mac_addr += valid_chars[random.randint(0, 15)]
+        new_mac_addr += valid_chars[random.randint(0, 15)]
+        if i != 2:
+            new_mac_addr += ":"
+    # make sure new mac addr doesn't match curr mac addr
+    if new_mac_addr == curr_mac_addr:
+        new_mac_addr = generate_random_mac_address(curr_mac_addr)
+    return new_mac_addr
+
+def get_current_mac_address(iface_name):
+    subproc = subprocess.Popen([EXT_PROG_IFCONFIG, iface_name], stdout=subprocess.PIPE, stderr=ERRLOG)
+    subproc.wait()
+    output = subproc.communicate()[0]
+    match = re.search(r"([0-9A-F]{2}[:]){5}[0-9A-F]{2}", output, re.I)
+    if match is not None:
+        return match.group()
+    return None    
+
+def anonymize_mac_address(iface_name):
+    print "[+] anonymizing interface " + GR + iface_name + WH + " mac address..."
+    # get current mac
+    curr_mac_addr = get_current_mac_address(iface_name)
+    if curr_mac_addr is not None:
+        global IFACE_ORIGINAL_MAC_ADDR
+        IFACE_ORIGINAL_MAC_ADDR = curr_mac_addr
+    else:
+        print RE + "[-] failed to anonymize interface " + GR + iface_name + RE + ", mac address not found!" + WH
+        return False
+    # generate random mac addr
+    global IFACE_ANONYMOUS_MAC_ADDR
+    IFACE_ANONYMOUS_MAC_ADDR = generate_random_mac_address(IFACE_ORIGINAL_MAC_ADDR)
+    # set new mac addr
+    if change_mac_address(iface_name, IFACE_ORIGINAL_MAC_ADDR, IFACE_ANONYMOUS_MAC_ADDR) == False:
+        print RE + "[-] failed to anonymize interface " + GR + iface_name + RE + ", could not set new mac address!" + WH
+        return False
+    global IFACE_MAC_ADDR_ANONYMIZED        
+    IFACE_MAC_ADDR_ANONYMIZED = True
+    return True 
+
+def verify_interface_exists(iface_name):
+    print "[+] verifying that interface " + GR + iface_name + WH + " exists..."
+    subproc = subprocess.Popen([EXT_PROG_IWCONFIG, iface_name], stdout=subprocess.PIPE, stderr=ERRLOG)
+    for line in subproc.communicate()[0].split("\n"):
+        if len(line) == 0:
+            continue
+        if ord(line[0]) != 32: # candidate interface name
+            candidate = line[:line.find(" ")]
+            if candidate == iface_name:
+                return True
+    print RE + "[-] interface " + GR + iface_name + RE + " not found!" + WH    
+    return False
+
+def verify_external_programs():
+    # TODO check that external programs are installed here
+    return True
+
+def initialize(iface_name):
+    print "[+] initializing..."
+    if verify_external_programs() == False:
+        return False
+    if verify_interface_exists(iface_name) == False:
+        return False
+    if anonymize_mac_address(iface_name) == False:
+        return False
+    return True
+
+def show_banner():
+    print GR
+    print " /$$$$$$$$                            /$$$$$$$$ /$$"
+    print "| $$_____/                           | $$_____/|__/"
+    print "| $$     /$$$$$$   /$$$$$$   /$$$$$$ | $$       /$$"
+    print "| $$$$$ /$$__  $$ /$$__  $$ /$$__  $$| $$$$$   | $$"
+    print "| $$__/| $$  \__/| $$$$$$$$| $$$$$$$$| $$__/   | $$"
+    print "| $$   | $$      | $$_____/| $$_____/| $$      | $$"
+    print "| $$   | $$      |  $$$$$$$|  $$$$$$$| $$      | $$"
+    print "|__/   |__/       \_______/ \_______/|__/      |__/"
+    print BL
+    print "           Information Wants to Be Free!           "
+    print WH
+    
+def print_help():
+    print "Usage: FreeFi <interface>\n"
+
+def handle_arguments():
+    if len(sys.argv) < 2:
+        print_help()
+        return False
+    global IFACE_ORIGINAL_NAME
+    IFACE_ORIGINAL_NAME = sys.argv[1]
+    return True
+
+"""
+access_points = find_access_points()
+filtered_access_points = filter_non_wps(access_points)
+connected = False
+
+for ap in filtered_access_points :
+    devices = find_connected_devices(ap)
+    for dev in devices :
+        if connect(dev) :
+            connected = True
+            break
+    if connected :
+        break
+else :
+    #couldn't find a connected user
+"""
+
+if __name__ == '__main__':
+    if handle_arguments() == False:
+        sys.exit()
+    try:
+        show_banner()
+        if initialize(IFACE_ORIGINAL_NAME) == True:
+            print "hi"
+            #find_open_access_points()
+    except KeyboardInterrupt:
+        print RE + "\n(^C) interrupted!" + WH
+    except EOFError:
+        print RE + "\n(^D) interrupted!" + WH
+    shutdown()
+
+
