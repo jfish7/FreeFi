@@ -18,21 +18,31 @@ import subprocess
 import os
 import re
 import random
+import time
+import signal
+import csv
 
 # Globals
-IFACE_ORIGINAL_NAME      = None
+IFACE_NAME               = None
 IFACE_ORIGINAL_MAC_ADDR  = None
 IFACE_ANONYMOUS_MAC_ADDR = None
 
 IFACE_MAC_ADDR_ANONYMIZED = False
 IFACE_IN_MONITOR_MODE     = False
 
-# Airmong-ng monitor mode interface name extension
-MONITOR_MODE_IFACE_NAME_EXTENSION = "mon"
-
 # External Programs
 EXT_PROG_IWCONFIG = "iwconfig"
 EXT_PROG_IFCONFIG = "ifconfig"
+EXT_PROG_AIRODUMP = "airodump-ng" 
+
+# airodump output files
+AIRODUMP_FILE_NAME_PREFIX = "./ff-airodump-ng"
+AIRODUMP_FILE_NAME_CSV_POSTFIX = "-01.csv"
+AIRODUMP_FILE_NAME_CAP_POSTFIX = "-01.cap"
+
+# exit codes
+EXIT_CODE_OK    = 0
+EXIT_CODE_ERROR = 1
 
 # Console colors
 WH = '\033[0m'
@@ -44,40 +54,201 @@ PU = '\033[35m'
 CY = '\033[36m' 
 
 # Route program outputs to /dev/null by default, but can be changed for debugging
-ERRLOG = open(os.devnull, "w")
 OUTLOG = open(os.devnull, "w")
+ERRLOG = open(os.devnull, "w")
 
-"""
-This function spoofs a mac address and tries to connect to Google without a redirect
-"""
-#def connect(mac): 
+# airodump csv parse state
+AIRODUMP_CSV_PARSE_STATE_HEADER        = 0
+AIRODUMP_CSV_PARSE_STATE_ACCESS_POINTS = 1
+AIRODUMP_CSV_PARSE_STATE_CLIENTS       = 2
 
-"""
-This function finds the devices connected to specfic access point
-"""
-#def find_connected_devices(ap):
+class AccessPoint:
+    def __init__(self, bssid, channel, privacy, power, essid):
+        self.bssid = bssid
+        self.channel = channel
+        self.privacy = privacy
+        self.power = power
+        self.essid = essid
 
-"""
-This function returns a list of dictionaries corresponding to an access point
-"""
-#def find_open_access_points():
+class Client:
+    def __init__(self, client_mac_addr, power, num_packets, access_point_mac_addr, essid):
+        self.client_mac_addr = client_mac_addr
+        self.power = power
+        self.num_packets = num_packets
+        self.access_point_mac_addr = access_point_mac_addr
+        self.essid = essid
 
-def shutdown():
+    def cprint(self):
+        print "Client: " + self.client_mac_addr + ", " + str(self.power) + ", " + \
+            str(self.num_packets) + ", " + self.access_point_mac_addr + ", " + self.essid
+
+def print_access_point_data_header():
+        print "   NUM ESSID             BSSID                 CH PRIV POWER #CLIENTS"
+        print "   --- ----------------- --------------------  -- ---- ----- --------"
+
+def print_access_point_data(row_number, ap, num_clients):
+        print "   " + str(row_number) + "  " + ap.essid + "  " + ap.bssid + "  " + str(ap.channel) + "  " + ap.privacy + \
+            "  " + str(ap.power) + "  " + str(num_clients)
+
+def parse_airodump_csv(filename):
+    if not os.path.exists(filename):
+        return ([], [])
+    access_points = []
+    clients = []
+    try:
+        parse_state = AIRODUMP_CSV_PARSE_STATE_HEADER
+        with open(filename, "rb") as csvfile:
+            reader = csv.reader(csvfile, delimiter=",")
+            for row in reader:
+                if parse_state == AIRODUMP_CSV_PARSE_STATE_HEADER:
+                    if len(row) < 1:
+                        continue
+                    if row[0].strip() == "BSSID":
+                        parse_state = AIRODUMP_CSV_PARSE_STATE_ACCESS_POINTS
+                        continue
+                if parse_state == AIRODUMP_CSV_PARSE_STATE_ACCESS_POINTS:
+                    if len(row) < 1:
+                        parse_state = AIRODUMP_CSV_PARSE_STATE_CLIENTS
+                        continue
+                    bssid = row[0].strip()
+                    channel = int(row[3].strip())
+                    privacy = row[5].strip()
+                    power = int(row[8].strip()) + 100
+                    essid = row[13].strip()
+                    if channel == -1:
+                        continue
+                    access_points.append(AccessPoint(bssid, channel, privacy, power, essid))
+                if parse_state == AIRODUMP_CSV_PARSE_STATE_CLIENTS:
+                    if len(row) < 1: # this is probably unnecessary, but doesn't hurt anything
+                        continue
+                    if row[0].strip() == "Station MAC":
+                        continue
+                    client_mac_addr = row[0].strip()
+                    power = int(row[3].strip()) + 100
+                    num_packets = int(row[4].strip())
+                    access_point_mac_addr = row[5].strip()
+                    essid = row[6].strip()
+                    clients.append(Client(client_mac_addr, power, num_packets, access_point_mac_addr, essid))
+    except IOError:
+        print RE + "[-] error while parsing airodump csv file " + GR + filename + WH
+        clean_shutdown(EXIT_CODE_ERROR)    
+    # sort access_points and cliens by power
+    access_points.sort(key=lambda ap: ap.power, reverse=True)
+    clients.sort(key=lambda c: c.power, reverse=True)
+    return (access_points, clients) 
+
+def kill_subprocess(subproc):
+    # handle killing subprocesses the same way wifite does
+    try:
+        os.kill(subproc.pid, signal.SIGINT)
+    except OSError:
+        pass
+    except TypeError:
+        pass
+    except UnboundLocalError:
+        pass
+    except AttributeError:
+        pass
+    try:
+        os.kill(subproc.pid, signal.SIGTERM)
+    except OSError:
+        pass
+    except UnboundLocalError:
+        pass    
+
+def remove_airodump_files():
+    try:
+        os.remove(AIRODUMP_FILE_NAME_PREFIX + AIRODUMP_FILE_NAME_CSV_POSTFIX)
+    except OSError:
+        pass
+    try:
+        os.remove(AIRODUMP_FILE_NAME_PREFIX + AIRODUMP_FILE_NAME_CAP_POSTFIX)
+    except OSError:
+        pass
+
+def scan_for_open_access_points(iface_name):
+    remove_airodump_files()
+    airodump_command = [EXT_PROG_AIRODUMP, 
+                        "-a",                               # filter unassociated clients
+                        "--write-interval", "1",            # write once a second
+                        "-w", AIRODUMP_FILE_NAME_PREFIX,    # output file prefix
+                        "-o", "csv",                        # only need the csv file now
+                        iface_name] 
+    subproc = subprocess.Popen(airodump_command, stdout=OUTLOG, stderr=ERRLOG)
+    # find and display open access points to user
+    open_access_points = None
+    try:
+        while True:
+            time.sleep(0.6)
+            if not os.path.exists(AIRODUMP_FILE_NAME_PREFIX + AIRODUMP_FILE_NAME_CSV_POSTFIX):
+                continue
+            # get data from airodump
+            (access_points, clients) = parse_airodump_csv(AIRODUMP_FILE_NAME_PREFIX + AIRODUMP_FILE_NAME_CSV_POSTFIX)
+            # display found access points
+            os.system("clear")
+            print "[+] scanning " + GR + "(" + iface_name + ")" + WH + \
+                " for open access points, updated every second, " + GR + "<CTRL-C>" + WH + " when ready..."
+            print ""
+            # filter for open access points
+            open_access_points = []
+            for ap in access_points:
+                if ap.privacy == "OPN":
+                    open_access_points.append(ap)
+            # print open access points
+            print_access_point_data_header()
+            for i, ap in enumerate(access_points):
+                print_access_point_data(i, ap, -1)
+
+            for c in clients:
+                c.cprint()
+
+            sys.stdout.flush()
+    except KeyboardInterrupt:
+        pass
+    # kill airodump subprocess
+    kill_subprocess(subproc)
+    remove_airodump_files() 
+    # let user select access point to target
+    print ""
+    print "Enter number of access point to target:"   
+    return True
+
+def disable_monitor_mode(iface_name):
+    print "[+] disabling monitor mode for interface " + GR + IFACE_NAME + WH + "..."
+    subprocess.call([EXT_PROG_IFCONFIG, iface_name, "down"], stdout=OUTLOG, stderr=ERRLOG)        
+    subprocess.call([EXT_PROG_IWCONFIG, iface_name, "mode", "managed"], stdout=OUTLOG, stderr=ERRLOG)        
+    subprocess.call([EXT_PROG_IFCONFIG, iface_name, "up"], stdout=OUTLOG, stderr=ERRLOG)        
+    # TODO verify that managed mode was set succesfully
+    return True
+
+def enable_monitor_mode(iface_name):
+    print "[+] enabling monitor mode for interface " + GR + IFACE_NAME + WH + "..." 
+    subprocess.call([EXT_PROG_IFCONFIG, iface_name, "down"], stdout=OUTLOG, stderr=ERRLOG)        
+    subprocess.call([EXT_PROG_IWCONFIG, iface_name, "mode", "monitor"], stdout=OUTLOG, stderr=ERRLOG)        
+    subprocess.call([EXT_PROG_IFCONFIG, iface_name, "up"], stdout=OUTLOG, stderr=ERRLOG)        
+    # TODO verify that monitor mode was set succesfully
+    return True
+
+def clean_shutdown(exit_code):
     print "[+] shutting down..."
     # undo monitor mode
+    if IFACE_IN_MONITOR_MODE == True:
+        disable_monitor_mode(IFACE_NAME)
     # undo mac address change
     if IFACE_MAC_ADDR_ANONYMIZED == True:
-        print "[+] resetting mac address for interface " + GR + IFACE_ORIGINAL_NAME + WH + "..."
-        change_mac_address(IFACE_ORIGINAL_NAME, IFACE_ANONYMOUS_MAC_ADDR, IFACE_ORIGINAL_MAC_ADDR)
+        print "[+] restoring mac address for interface " + GR + IFACE_NAME + WH + "..."
+        change_mac_address(IFACE_NAME, IFACE_ORIGINAL_MAC_ADDR)
     print "done\n"
+    sys.exit(exit_code)
 
-def change_mac_address(iface_name, curr_mac_addr, new_mac_addr):
-    print "[+] changing mac address for interface " + GR + iface_name + WH + " from " + CY + \
-        curr_mac_addr + WH + " to " + CY + new_mac_addr + "..." + WH
+def change_mac_address(iface_name, new_mac_addr, silent=False):
+    if silent == False:
+        print "[+] changing mac address to " + CY + new_mac_addr + "..." + WH
     subprocess.call([EXT_PROG_IFCONFIG, iface_name, "down"], stdout=OUTLOG, stderr=ERRLOG)
     subproc = subprocess.Popen([EXT_PROG_IFCONFIG, iface_name, 'hw', 'ether', new_mac_addr], stdout=OUTLOG, stderr=ERRLOG)
     subproc.wait()
-    subprocess.call([EXT_PROG_IFCONFIG, iface_name, 'up'], stdout=OUTLOG, stderr=ERRLOG)    
+    subprocess.call([EXT_PROG_IFCONFIG, iface_name, "up"], stdout=OUTLOG, stderr=ERRLOG)    
+    return True
     if get_current_mac_address(iface_name) == new_mac_addr:
         return True
     return False
@@ -117,15 +288,21 @@ def anonymize_mac_address(iface_name):
         print RE + "[-] failed to anonymize interface " + GR + iface_name + RE + ", mac address not found!" + WH
         return False
     # generate random mac addr
-    global IFACE_ANONYMOUS_MAC_ADDR
-    IFACE_ANONYMOUS_MAC_ADDR = generate_random_mac_address(IFACE_ORIGINAL_MAC_ADDR)
+    random_mac_addr = generate_random_mac_address(IFACE_ORIGINAL_MAC_ADDR)
     # set new mac addr
-    if change_mac_address(iface_name, IFACE_ORIGINAL_MAC_ADDR, IFACE_ANONYMOUS_MAC_ADDR) == False:
+    if change_mac_address(iface_name, random_mac_addr) == False:
         print RE + "[-] failed to anonymize interface " + GR + iface_name + RE + ", could not set new mac address!" + WH
         return False
     global IFACE_MAC_ADDR_ANONYMIZED        
     IFACE_MAC_ADDR_ANONYMIZED = True
     return True 
+
+"""
+def kill_interfering_processes():
+    print "[+] killing interfering processes..."
+    #subprocess.call([EXT_PROG_AIRMON_NG, "check", "kill"], stdout=OUTLOG, stderr=ERRLOG) 
+    return True;
+"""
 
 def verify_interface_exists(iface_name):
     print "[+] verifying that interface " + GR + iface_name + WH + " exists..."
@@ -150,8 +327,14 @@ def initialize(iface_name):
         return False
     if verify_interface_exists(iface_name) == False:
         return False
+    #if kill_interfering_processes() == False:
+    #    return False;
     if anonymize_mac_address(iface_name) == False:
         return False
+    if enable_monitor_mode(iface_name) == False:
+        return False
+    global IFACE_IN_MONITOR_MODE
+    IFACE_IN_MONITOR_MODE = True 
     return True
 
 def show_banner():
@@ -175,10 +358,41 @@ def handle_arguments():
     if len(sys.argv) < 2:
         print_help()
         return False
-    global IFACE_ORIGINAL_NAME
-    IFACE_ORIGINAL_NAME = sys.argv[1]
+    global IFACE_NAME
+    IFACE_NAME = sys.argv[1]
     return True
 
+if __name__ == '__main__':
+    if handle_arguments() == False:
+        sys.exit()
+    try:
+        show_banner()
+        disable_monitor_mode(IFACE_NAME) #temp temp
+        if initialize(IFACE_NAME) == True:
+            scan_for_open_access_points(IFACE_NAME)
+            #print "hi this is where the magic happens"
+            #raw_input("press <enter> to continue")
+            #find_open_access_points()
+    except KeyboardInterrupt:
+        print RE + "\n(^C) interrupted!" + WH
+    except EOFError:
+        print RE + "\n(^D) interrupted!" + WH
+    clean_shutdown(EXIT_CODE_OK)
+
+
+
+
+
+
+"""
+This function spoofs a mac address and tries to connect to Google without a redirect
+"""
+#def connect(mac): 
+
+"""
+This function finds the devices connected to specfic access point
+"""
+#def find_connected_devices(ap):
 """
 access_points = find_access_points()
 filtered_access_points = filter_non_wps(access_points)
@@ -195,19 +409,3 @@ for ap in filtered_access_points :
 else :
     #couldn't find a connected user
 """
-
-if __name__ == '__main__':
-    if handle_arguments() == False:
-        sys.exit()
-    try:
-        show_banner()
-        if initialize(IFACE_ORIGINAL_NAME) == True:
-            print "hi"
-            #find_open_access_points()
-    except KeyboardInterrupt:
-        print RE + "\n(^C) interrupted!" + WH
-    except EOFError:
-        print RE + "\n(^D) interrupted!" + WH
-    shutdown()
-
-
