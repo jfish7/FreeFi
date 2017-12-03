@@ -11,6 +11,14 @@
     Bypass MAC based security of Wifi access points
 
     Team 6: Jonathan Fisher, Kevin Hwang, Steven Ritchie, Kiankris Villagonzalo, Sean Wang 
+
+    Fun extensions to do:
+    - periodically check that wifi is still connected to AP, reconnect if necessary
+    - print IP address of connection
+    - display http traffic of clients
+    - deauth the spoofed client? Not sure if this is necessary.
+    - 
+
 """
 # Libraries
 import sys
@@ -203,7 +211,7 @@ def select_open_access_point_target(iface_name):
             # display found access points
             os.system("clear")
             print "[+] scanning " + GR + iface_name + WH + \
-                " for open access points, updated every second, " + GR + "<CTRL-C>" + WH + " when ready" + \
+                " for open access points, updated every second.\n\n" + GR + "    <CTRL-C>" + WH + " when ready" + \
                 get_animated_ellipses(scan_count % 3 + 1)    
             print ""
             # filter for open access points
@@ -282,7 +290,7 @@ def select_client_target(iface_name, target_access_point):
             # display found access points
             os.system("clear")
             print "[+] scanning for clients connected to " + GR + target_access_point.essid + \
-                 WH + ", updated every second, " + GR + "<CTRL-C>" + WH + " when ready" + \
+                 WH + ", updated every second.\n\n" + GR + "    <CTRL-C>" + WH + " when ready" + \
                 get_animated_ellipses(scan_count % 3 + 1) 
             print ""
             # filter clients by ap bssid
@@ -488,8 +496,9 @@ def setup_connection_and_wait(iface_name, target_access_point, target_client):
         while True:
             time.sleep(0.6)
             os.system("clear")
-            print "[+] Connected to access point " + GR + target_access_point.essid + WH + ", with MAC " + GR + \
-                target_client.client_mac_addr + ",\n" + "   <CTRL-C>" + WH + " when done" + get_animated_ellipses(scan_count % 3 + 1) 
+            print "[+] Connected to " + GR + target_access_point.essid + WH + " with mac address " + \
+                CY + target_access_point.bssid + WH + ",\n" + "    client mac address is " + CY + \
+                target_client.client_mac_addr + ".\n\n" + GR + "    <CTRL-C>" + WH + " when done" + get_animated_ellipses(scan_count % 3 + 1) 
             scan_count += 1
     except KeyboardInterrupt:
         print ""
