@@ -49,6 +49,10 @@ AIRODUMP_FILE_NAME_PREFIX = "./ff-airodump-ng"
 AIRODUMP_FILE_NAME_CSV_POSTFIX = "-01.csv"
 AIRODUMP_FILE_NAME_CAP_POSTFIX = "-01.cap"
 
+# constants
+MAX_NUM_ACCESS_POINTS_TO_DISPLAY = 20
+MAX_NUM_CLIENTS_TO_DISPLAY       = 20
+
 # exit codes
 EXIT_CODE_OK    = 0
 EXIT_CODE_ERROR = 1
@@ -66,11 +70,6 @@ CY = '\033[36m'
 OUTLOG = open(os.devnull, "w")
 ERRLOG = open(os.devnull, "w")
 
-# airodump csv parse state
-AIRODUMP_CSV_PARSE_STATE_HEADER        = 0
-AIRODUMP_CSV_PARSE_STATE_ACCESS_POINTS = 1
-AIRODUMP_CSV_PARSE_STATE_CLIENTS       = 2
-
 class AccessPoint:
     def __init__(self, bssid, channel, privacy, power, essid):
         self.bssid = bssid
@@ -80,32 +79,27 @@ class AccessPoint:
         self.essid = essid
 
 def print_access_point_data_header():
-    print "   NUM ESSID                            BSSID             CH PRIV POWER #CLIENTS"
-    print "   --- -------------------------------- ----------------- -- ---- ----- --------"
+    print "   NUM ESSID                            BSSID             CH PRIV PWR"
+    print "   --- -------------------------------- ----------------- -- ---- ---"
 
-def print_access_point_data(row_number, ap, num_clients):
-    print "   " + str(row_number) + "  " + ap.essid + "  " + ap.bssid + "  " + str(ap.channel) + \
-        "  " + ap.privacy + "  " + str(ap.power) + "  " + str(num_clients)
+def print_access_point_data(row_number, ap):
+    print "   %3s %-32s %17s %2s %-4s %3s" % (str(row_number), ap.essid, ap.bssid, \
+        str(ap.channel), ap.privacy, str(ap.power))
 
 class Client:
-    def __init__(self, client_mac_addr, power, num_packets, access_point_mac_addr, essid):
+    def __init__(self, client_mac_addr, power, num_packets, access_point_mac_addr):
         self.client_mac_addr = client_mac_addr
         self.power = power
         self.num_packets = num_packets
         self.access_point_mac_addr = access_point_mac_addr
-        self.essid = essid
-
-    def cprint(self):
-        print "Client: " + self.client_mac_addr + ", " + str(self.power) + ", " + \
-            str(self.num_packets) + ", " + self.access_point_mac_addr + ", " + self.essid
 
 def print_client_data_header():
-    print "   NUM CLIENT BSSID      POWER #PACKETS AP BSSID          AP ESSID"
-    print "   --- ----------------- ----- -------- ----------------- --------------------------------"
+    print "   NUM CLIENT BSSID      PWR #PKTS AP BSSID         "
+    print "   --- ----------------- --- ----- -----------------"
                 
 def print_client_data(row_number, client):
-    print "   " + str(row_number) + "  " + client.client_mac_addr + "  " + str(client.power) + "  " + \
-        str(client.num_packets) + "  " + client.access_point_mac_addr + "  " + client.essid 
+    print "   %3s %17s %3s %5s %17s" % (str(row_number), client.client_mac_addr, \
+        str(client.power), str(client.num_packets), client.access_point_mac_addr)
 
 def parse_airodump_csv(filename):
     if not os.path.exists(filename):
@@ -113,29 +107,37 @@ def parse_airodump_csv(filename):
     access_points = []
     clients = []
     try:
-        parse_state = AIRODUMP_CSV_PARSE_STATE_HEADER
+        # airodump csv parse state
+        parse_state_header        = 0
+        parse_state_access_points = 1
+        parse_state_clients       = 2
+        parse_state = parse_state_header
         with open(filename, "rb") as csvfile:
             reader = csv.reader(csvfile, delimiter=",")
             for row in reader:
-                if parse_state == AIRODUMP_CSV_PARSE_STATE_HEADER:
+                if parse_state == parse_state_header:
                     if len(row) < 1:
                         continue
                     if row[0].strip() == "BSSID":
-                        parse_state = AIRODUMP_CSV_PARSE_STATE_ACCESS_POINTS
+                        parse_state = parse_state_access_points
                         continue
-                if parse_state == AIRODUMP_CSV_PARSE_STATE_ACCESS_POINTS:
+                if parse_state == parse_state_access_points:
                     if len(row) < 1:
-                        parse_state = AIRODUMP_CSV_PARSE_STATE_CLIENTS
+                        parse_state = parse_state_clients
                         continue
                     bssid = row[0].strip()
                     channel = int(row[3].strip())
                     privacy = row[5].strip()
-                    power = int(row[8].strip()) + 100
+                    power = int(row[8].strip())
+                    if power == -1:
+                        continue
+                    else:
+                        power += 100
                     essid = row[13].strip()
                     if channel == -1:
                         continue
                     access_points.append(AccessPoint(bssid, channel, privacy, power, essid))
-                if parse_state == AIRODUMP_CSV_PARSE_STATE_CLIENTS:
+                if parse_state == parse_state_clients:
                     if len(row) < 1: # this is probably unnecessary, but doesn't hurt anything
                         continue
                     if row[0].strip() == "Station MAC":
@@ -144,8 +146,7 @@ def parse_airodump_csv(filename):
                     power = int(row[3].strip()) + 100
                     num_packets = int(row[4].strip())
                     access_point_mac_addr = row[5].strip()
-                    essid = row[6].strip()
-                    clients.append(Client(client_mac_addr, power, num_packets, access_point_mac_addr, essid))
+                    clients.append(Client(client_mac_addr, power, num_packets, access_point_mac_addr))
     except IOError:
         print RE + "[-] error while parsing airodump csv file " + GR + filename + WH
         clean_shutdown(EXIT_CODE_ERROR)    
@@ -222,7 +223,9 @@ def select_open_access_point_target(iface_name):
             # print open access points
             print_access_point_data_header()
             for i, ap in enumerate(open_access_points):
-                print_access_point_data(i, ap, -1)
+                print_access_point_data(i, ap)
+                if i >= MAX_NUM_ACCESS_POINTS_TO_DISPLAY:
+                    break
             print ""
             sys.stdout.flush()
             scan_count += 1
@@ -246,7 +249,9 @@ def select_open_access_point_target(iface_name):
             print ""            
             print_access_point_data_header()
             for i, ap in enumerate(open_access_points):
-                print_access_point_data(i, ap, -1)
+                print_access_point_data(i, ap)
+                if i >= MAX_NUM_ACCESS_POINTS_TO_DISPLAY:
+                    break                
             print ""
             sys.stdout.flush()
             user_input = raw_input(GR + "Enter number of access point to target: " + WH)
@@ -490,6 +495,7 @@ def setup_connection_and_wait(iface_name, target_access_point, target_client):
     print "[+] Setting up connection..."
     disable_monitor_mode(iface_name)
     change_mac_address(IFACE_NAME, target_client.client_mac_addr)
+    time.sleep(3)
     connect_to_access_point(target_access_point)
     scan_count = 0
     try:

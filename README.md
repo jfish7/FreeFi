@@ -79,4 +79,9 @@ we're doing to not interfere with NetworkManager so that we can still use it to 
 in general, often the stuff I can find online is wrong or outdated or just didn't do anything
 at all. For example, Using nmcli to connect to wifi AP was the only way that worked reliably vs
 using 'iwconfig wlan0 essid {access_point}'
-- 
+
+
+- it would be nice to fully spoof the target client even in the browser headers, for some reason
+the web server might be throwing a fit when it's getting oddly different browser info from
+different users (did it crash the server)?
+ 
